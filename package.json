@@ -6,6 +6,9 @@
   "scripts": {
     "start": "npx tsx src/index.ts",
     "login": "npx tsx src/login.ts",
+    "login:zai": "npx tsx src/loginZai.ts",
+    "debug:zai": "npx tsx src/debugZai.ts",
+    "doctor": "npx tsx src/doctor.ts",
     "test": "tsx --test src/**/*.test.ts",
     "build": "tsc"
   },

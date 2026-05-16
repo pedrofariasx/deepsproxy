@@ -49,6 +49,14 @@ export interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  stop?: string | string[];
+  parallel_tool_calls?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
   /** List of tools available to the LLM */
   tools?: FunctionToolDefinition[];
   /** Control whether the LLM must/can call tools */

@@ -1,6 +1,12 @@
 node_modules/
 dist/
 deepseek_profile/
+zai_profile/
+zai_token.json
+zai_debug_request.json
+task.md
+changelog.md
+CHANGELOG.md
 .env
 .env.local
 *.log

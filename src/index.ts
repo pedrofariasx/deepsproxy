@@ -14,6 +14,9 @@ import { cors } from 'hono/cors';
 import { chatCompletions } from './routes/chat.ts';
 import * as dotenv from 'dotenv';
 import { initPlaywright } from './services/playwright.ts';
+import { router } from './providers/router.ts';
+import { closePlaywright } from './services/playwright.ts';
+import { releaseAllProfileLocks } from './utils/profileLock.ts';
 
 dotenv.config();
 
@@ -34,62 +37,62 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// Basic health check
-app.get('/health', (c) => c.json({ status: 'ok' }));
+// Basic health check — includes provider status
+app.get('/health', async (c) => {
+  const providerHealth = router.getHealthStatus();
+  const providerStatuses = Object.entries(providerHealth)
+    .filter(([name]) => name !== 'router')
+    .map(([, health]) => health.status);
+  const hasHealthyProvider = providerStatuses.includes('healthy') || providerStatuses.includes('degraded');
+  const hasOfflineProvider = providerStatuses.includes('offline');
+
+  return c.json({
+    status: hasHealthyProvider ? (hasOfflineProvider ? 'degraded' : 'ok') : 'offline',
+    providers: providerHealth,
+  });
+});
+
+app.get('/v1/provider-status', async (c) => {
+  return c.json(router.getProviderStatus());
+});
 
 // OpenAI compatible routes
 app.post('/v1/chat/completions', chatCompletions);
 
-app.get('/v1/models', (c) => {
+// Dynamic model listing from all providers
+app.get('/v1/models', async (c) => {
+  const models = await router.listAllModels();
+
   return c.json({
     object: 'list',
-    data: [
-      {
-        id: 'deepseek-v4-flash',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-v4-flash',
-        parent: null,
-      },
-      {
-        id: 'deepseek-v4-flash-thinking',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-v4-flash-thinking',
-        parent: null,
-      },
-      {
-        id: 'deepseek-v4-pro',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-v4-pro',
-        parent: null,
-      },
-      {
-        id: 'deepseek-v4-pro-thinking',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-v4-pro-thinking',
-        parent: null,
-      }
-    ]
+    data: models.map(m => ({
+      id: m.id,
+      object: 'model',
+      created: m.created,
+      owned_by: m.owned_by,
+      permission: [],
+      root: m.id,
+      parent: null,
+    })),
   });
 });
 
-// Initialize playwright when server starts
+// Initialize playwright and providers when server starts
 import { fileURLToPath } from 'url';
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  initPlaywright().then(() => {
-    console.log('Playwright initialized.');
+  (async () => {
+    // Initialize Playwright for DeepSeek provider
+    try {
+      await initPlaywright();
+      console.log('Playwright initialized.');
+    } catch (err: any) {
+      console.warn('Playwright initialization failed (DeepSeek provider may be unavailable):', err.message);
+    }
+
+    // Initialize all providers (each independently)
+    await router.initialize();
+
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     console.log(`Server is running on port ${port}`);
 
@@ -97,8 +100,22 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       fetch: app.fetch,
       port
     });
-  }).catch((err: any) => {
-    console.error('Failed to initialize playwright:', err);
+
+    const shutdown = async (signal: string) => {
+      console.log(`Received ${signal}, shutting down...`);
+      try {
+        await router.shutdown();
+        await closePlaywright();
+      } finally {
+        releaseAllProfileLocks();
+      }
+      process.exit(0);
+    };
+
+    process.once('SIGINT', () => void shutdown('SIGINT'));
+    process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  })().catch((err: any) => {
+    console.error('Failed to start server:', err);
     process.exit(1);
   });
 }

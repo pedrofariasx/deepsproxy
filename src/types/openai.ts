@@ -84,6 +84,14 @@ export interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  stop?: string | string[];
+  parallel_tool_calls?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
   tools?: FunctionToolDefinition[];
   tool_choice?: ToolChoice;
 }

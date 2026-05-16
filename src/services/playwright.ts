@@ -10,10 +10,12 @@
 
 import { chromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
+import { acquireProfileLock, releaseProfileLock } from '../utils/profileLock.ts';
 
 let context: BrowserContext | null = null;
 export let activePage: Page | null = null;
 let currentHeaders: Record<string, string> = {};
+let profileLockPath: string | null = null;
 
 export async function initPlaywright(headless = true) {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
@@ -22,19 +24,26 @@ export async function initPlaywright(headless = true) {
   }
 
   const profilePath = path.resolve('deepseek_profile');
+  profileLockPath = acquireProfileLock(profilePath);
 
-  context = await chromium.launchPersistentContext(profilePath, {
-    headless,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--exclude-switches=enable-automation',
-      '--disable-infobars',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-    ],
-  });
+  try {
+    context = await chromium.launchPersistentContext(profilePath, {
+      headless,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--exclude-switches=enable-automation',
+        '--disable-infobars',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
+    });
+  } catch (err) {
+    releaseProfileLock(profileLockPath);
+    profileLockPath = null;
+    throw err;
+  }
 
   // Keep an active page to fetch PoW headers on demand
   activePage = await context.newPage();
@@ -47,6 +56,8 @@ export async function closePlaywright() {
     context = null;
     activePage = null;
   }
+  releaseProfileLock(profileLockPath);
+  profileLockPath = null;
 }
 
 /**
