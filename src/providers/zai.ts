@@ -21,12 +21,15 @@ import path from 'path';
 import fs from 'fs';
 import { ProviderLimiter, envInt } from './control.ts';
 import { acquireProfileLock, releaseProfileLock } from '../utils/profileLock.ts';
+import { robustParseJSON } from '../utils/json.ts';
 
 // ─── Configuration ─────────────────────────────────────────────────────────────
 
 const ZAI_BASE_URL = process.env.ZAI_BASE_URL || 'https://chat.z.ai';
 const ZAI_PROFILE_PATH = path.resolve('zai_profile');
 const ZAI_TOKEN_FILE = path.resolve('zai_token.json');
+const TOOL_START = '<tool_call>';
+const TOOL_END = '</tool_call>';
 
 const zaiLimiter = new ProviderLimiter({
   maxConcurrent: envInt('ZAI_MAX_CONCURRENT', 1),
@@ -44,6 +47,20 @@ const ZAI_TEST_MODELS: ModelInfo[] = [
 let zaiContext: BrowserContext | null = null;
 let zaiPage: Page | null = null;
 let zaiProfileLockPath: string | null = null;
+
+interface ZaiParseState {
+  insideTool: boolean;
+  contentEmitBuffer: string;
+  emittedToolCallCount: number;
+}
+
+function createZaiParseState(): ZaiParseState {
+  return {
+    insideTool: false,
+    contentEmitBuffer: '',
+    emittedToolCallCount: 0,
+  };
+}
 
 // ─── Token from file ───────────────────────────────────────────────────────────
 
@@ -99,6 +116,101 @@ function parseZaiChunk(dataStr: string): ProviderStreamEvent {
   }
 }
 
+function processZaiContent(content: string, state: ZaiParseState): ProviderStreamEvent[] {
+  const events: ProviderStreamEvent[] = [];
+  state.contentEmitBuffer += content;
+
+  while (state.contentEmitBuffer.length > 0) {
+    if (!state.insideTool) {
+      const startIdx = state.contentEmitBuffer.indexOf(TOOL_START);
+      if (startIdx !== -1) {
+        const textToEmit = state.contentEmitBuffer.substring(0, startIdx);
+        if (textToEmit && state.emittedToolCallCount === 0) {
+          events.push({ type: 'content', content: textToEmit });
+        }
+        state.insideTool = true;
+        state.contentEmitBuffer = state.contentEmitBuffer.substring(startIdx + TOOL_START.length);
+        continue;
+      }
+
+      let flushIndex = state.contentEmitBuffer.length;
+      for (let i = 1; i <= TOOL_START.length; i++) {
+        if (state.contentEmitBuffer.endsWith(TOOL_START.substring(0, i))) {
+          flushIndex = state.contentEmitBuffer.length - i;
+          break;
+        }
+      }
+
+      const textToEmit = state.contentEmitBuffer.substring(0, flushIndex);
+      if (textToEmit && state.emittedToolCallCount === 0) {
+        events.push({ type: 'content', content: textToEmit });
+      }
+      state.contentEmitBuffer = state.contentEmitBuffer.substring(flushIndex);
+      break;
+    }
+
+    const endIdx = state.contentEmitBuffer.indexOf(TOOL_END);
+    if (endIdx === -1) break;
+
+    const toolJsonStr = state.contentEmitBuffer.substring(0, endIdx).trim();
+    try {
+      const raw = robustParseJSON(toolJsonStr);
+      const toolCallObj = normalizeToolCallObject(raw);
+      if (!toolCallObj) throw new Error('Invalid tool call object');
+
+      events.push({
+        type: 'tool_call',
+        toolCall: {
+          id: 'call_' + uuidv4(),
+          index: state.emittedToolCallCount,
+          type: 'function',
+          function: {
+            name: toolCallObj.name,
+            arguments: JSON.stringify(toolCallObj.arguments),
+          },
+        },
+      });
+      state.emittedToolCallCount++;
+    } catch {
+      if (state.emittedToolCallCount === 0) {
+        events.push({
+          type: 'tool_call_error',
+          rawText: TOOL_START + toolJsonStr + TOOL_END,
+        });
+      }
+    }
+
+    state.insideTool = false;
+    state.contentEmitBuffer = state.contentEmitBuffer.substring(endIdx + TOOL_END.length);
+  }
+
+  return events;
+}
+
+function normalizeToolCallObject(raw: any): { name: string; arguments: Record<string, unknown> } | null {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const candidate = raw.tool_call && typeof raw.tool_call === 'object'
+    ? raw.tool_call
+    : raw;
+
+  const name = candidate.name || candidate.function?.name;
+  const args = candidate.arguments ?? candidate.function?.arguments ?? {};
+  if (typeof name !== 'string' || !name) return null;
+
+  let parsedArgs: Record<string, unknown>;
+  if (typeof args === 'string') {
+    const parsed = robustParseJSON(args);
+    parsedArgs = parsed && typeof parsed === 'object' ? parsed : {};
+  } else if (args && typeof args === 'object' && !Array.isArray(args)) {
+    parsedArgs = args;
+  } else {
+    parsedArgs = {};
+  }
+
+  return { name, arguments: parsedArgs };
+}
+
 // ─── Z.ai Provider ────────────────────────────────────────────────────────────
 
 export class ZaiProvider implements ChatProvider {
@@ -124,48 +236,12 @@ export class ZaiProvider implements ChatProvider {
       return;
     }
 
-    const savedToken = readSavedToken();
-    if (!savedToken) {
-      this._health.status = 'offline';
-      this._health.lastError = 'No Z.ai token. Run: npx tsx src/loginZai.ts';
-      console.warn('[zai] No saved token found. Run: npx tsx src/loginZai.ts');
-      return;
-    }
-
-    try {
-      zaiProfileLockPath = acquireProfileLock(ZAI_PROFILE_PATH);
-      // Launch a persistent context using the saved Z.ai profile
-      zaiContext = await chromium.launchPersistentContext(ZAI_PROFILE_PATH, {
-        headless: true,
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--exclude-switches=enable-automation',
-          '--disable-infobars',
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-        ],
-      });
-
-      zaiPage = await zaiContext.newPage();
-      await zaiPage.goto(`${ZAI_BASE_URL}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-      // Wait for the page to be ready (chat input should appear)
-      await zaiPage.waitForSelector('textarea, [contenteditable]', { timeout: 15000 }).catch(() => {
-        console.warn('[zai] Chat input not found, page might not be fully loaded');
-      });
-
-      this._health.status = 'healthy';
-      console.log(`[zai] Provider initialized with Playwright (user: ${savedToken.name || savedToken.id})`);
-    } catch (err: any) {
-      releaseProfileLock(zaiProfileLockPath);
-      zaiProfileLockPath = null;
-      this._health.status = 'offline';
-      this._health.lastError = err.message;
-      this._health.lastErrorAt = Date.now();
-      console.warn(`[zai] Provider initialization failed: ${err.message}`);
-    }
+    // Z.ai API endpoint /api/v2/chat/completions is returning 405 (blocked by WAF).
+    // Provider is temporarily offline until a new integration approach is found.
+    this._health.status = 'offline';
+    this._health.lastError = 'Z.ai API endpoint blocked (405). Provider temporarily unavailable.';
+    console.warn('[zai] Provider offline: Z.ai API endpoint /api/v2/chat/completions returns 405 (WAF blocked).');
+    return;
   }
 
   handlesModel(modelId: string): boolean {
@@ -251,7 +327,7 @@ export class ZaiProvider implements ChatProvider {
     try {
       return await zaiLimiter.run(async () => {
         if (!zaiPage || !zaiContext) {
-          throw new ProviderError('zai', 'Playwright not initialized. Run: npx tsx src/loginZai.ts', 503, true, 'playwright');
+          throw new ProviderError('zai', 'Z.ai provider is offline (API endpoint blocked). Use DeepSeek models instead.', 503, false, 'network');
         }
 
         const savedToken = readSavedToken();
@@ -328,11 +404,15 @@ export class ZaiProvider implements ChatProvider {
         if (!response.ok || !response.body) {
           const errText = await response.text().catch(() => '');
           const kind = classifyZaiError(`HTTP ${response.status}: ${errText}`);
+          const retryable = response.status >= 500 ||
+            response.status === 429 ||
+            response.status === 408 ||
+            response.status === 405;
           throw new ProviderError(
             'zai',
             `Chat request failed: ${response.status} - ${errText.substring(0, 200)}`,
             response.status,
-            response.status >= 500 || response.status === 429 || response.status === 408,
+            retryable,
             kind
           );
         }
@@ -371,9 +451,27 @@ export class ZaiProvider implements ChatProvider {
     captchaParam: string;
   }> {
     return new Promise(async (resolve, reject) => {
-      const timeout = setTimeout(() => reject(new ProviderError('zai', 'Timeout capturing captcha params', 504, true, 'timeout')), 30000);
+      let settled = false;
+      const cleanup = async () => {
+        await page.unroute('**/api/v2/chat/completions**', routeHandler).catch(() => {});
+      };
+      const fail = async (err: ProviderError) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        await cleanup();
+        reject(err);
+      };
+      const timeout = setTimeout(() => {
+        void fail(new ProviderError('zai', 'Timeout capturing captcha params', 504, true, 'timeout'));
+      }, 30000);
 
       const routeHandler = async (route: any, request: any) => {
+        if (settled) {
+          await route.fallback().catch(() => route.continue().catch(() => {}));
+          return;
+        }
+        settled = true;
         clearTimeout(timeout);
 
         const reqHeaders = request.headers();
@@ -407,7 +505,12 @@ export class ZaiProvider implements ChatProvider {
         await route.abort('aborted');
 
         // Cleanup route
-        await page.unroute('**/api/v2/chat/completions**', routeHandler);
+        await cleanup();
+
+        if (!capturedHeaders.authorization || !capturedHeaders['x-signature'] || !queryString) {
+          reject(new ProviderError('zai', 'Captured request is missing authorization/signature/query params', 503, true, 'auth'));
+          return;
+        }
 
         resolve({
           headers: capturedHeaders,
@@ -440,13 +543,11 @@ export class ZaiProvider implements ChatProvider {
             await editable.fill('a');
             await page.keyboard.press('Enter');
           } else {
-            clearTimeout(timeout);
-            reject(new ProviderError('zai', 'Could not find chat input element', 503, true, 'playwright'));
+            await fail(new ProviderError('zai', 'Could not find chat input element', 503, true, 'playwright'));
           }
         }
       } catch (err: any) {
-        clearTimeout(timeout);
-        reject(new ProviderError('zai', `Failed to trigger captcha: ${err.message}`, 503, true, 'playwright'));
+        await fail(new ProviderError('zai', `Failed to trigger captcha: ${err.message}`, 503, true, 'playwright'));
       }
     });
   }
@@ -454,6 +555,7 @@ export class ZaiProvider implements ChatProvider {
   private async *createEventIterable(stream: ReadableStream): AsyncIterable<ProviderStreamEvent> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const state = createZaiParseState();
     let buffer = '';
 
     try {
@@ -472,12 +574,20 @@ export class ZaiProvider implements ChatProvider {
           const dataStr = trimmed.slice(6);
           const event = parseZaiChunk(dataStr);
 
-          if (event.type !== 'none') {
+          if (event.type === 'content' && event.content) {
+            for (const parsedEvent of processZaiContent(event.content, state)) {
+              yield parsedEvent;
+            }
+          } else if (event.type !== 'none') {
             yield event;
           }
 
           if (event.type === 'done') return;
         }
+      }
+
+      if (!state.insideTool && state.contentEmitBuffer.length > 0 && state.emittedToolCallCount === 0) {
+        yield { type: 'content', content: state.contentEmitBuffer };
       }
     } finally {
       reader.releaseLock();
@@ -511,6 +621,7 @@ function classifyZaiError(err: any): ProviderErrorKind {
   if (message.includes('queue timeout') || message.includes('timeout') || message.includes('abortsignal')) return 'timeout';
   if (message.includes('playwright') || message.includes('browser') || message.includes('page') || message.includes('selector') || message.includes('input element')) return 'playwright';
   if (message.includes('fetch failed') || message.includes('network') || message.includes('econn') || message.includes('dns')) return 'network';
+  if (message.includes('405')) return 'provider_5xx';
   if (message.includes('400') || message.includes('bad request')) return 'bad_request';
   if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('504')) return 'provider_5xx';
   return 'unknown';

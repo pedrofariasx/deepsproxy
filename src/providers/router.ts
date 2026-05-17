@@ -34,9 +34,9 @@ interface ModelCandidate {
 }
 
 const DEFAULT_ALIASES: Record<string, string[]> = {
-  'cheap-coder': ['deepseek-v4-flash-thinking', 'GLM-4.6'],
-  'fast-coder': ['GLM-4.6', 'deepseek-v4-flash'],
-  'thinking-coder': ['deepseek-v4-pro-thinking', 'GLM-4.6'],
+  'cheap-coder': ['deepseek-v4-flash-thinking'],
+  'fast-coder': ['deepseek-v4-flash'],
+  'thinking-coder': ['deepseek-v4-pro-thinking'],
 };
 
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
