@@ -48,6 +48,12 @@ let zaiContext: BrowserContext | null = null;
 let zaiPage: Page | null = null;
 let zaiProfileLockPath: string | null = null;
 
+// Shared state for browser-based streaming (managed via page.exposeFunction)
+let zaiChunkQueue: string[] = [];
+let zaiDonePushing = false;
+let zaiPushError: Error | null = null;
+let zaiExposeInitialized = false;
+
 interface ZaiParseState {
   insideTool: boolean;
   contentEmitBuffer: string;
@@ -236,8 +242,9 @@ export class ZaiProvider implements ChatProvider {
       return;
     }
 
-    // Z.ai API endpoint /api/v2/chat/completions is returning 405 (blocked by WAF).
-    // Provider is temporarily offline until a new integration approach is found.
+    // Z.ai API endpoint /api/v2/chat/completions returns 405 (WAF blocked).
+    // Tested with: different accounts, browser fetch, realistic User-Agent,
+    // and direct browser evaluate(). All return 405. Endpoint is offline.
     this._health.status = 'offline';
     this._health.lastError = 'Z.ai API endpoint blocked (405). Provider temporarily unavailable.';
     console.warn('[zai] Provider offline: Z.ai API endpoint /api/v2/chat/completions returns 405 (WAF blocked).');
@@ -392,30 +399,80 @@ export class ZaiProvider implements ChatProvider {
         const queryString = capturedData.queryString;
         const url = `${ZAI_BASE_URL}/api/v2/chat/completions?${queryString}`;
 
-        console.log(`[zai] POST /api/v2/chat/completions (model: ${options.model})`);
+        console.log(`[zai] POST /api/v2/chat/completions via browser (model: ${options.model})`);
 
-        const response = await fetch(url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(120000),
+        // Reset shared state for this request
+        zaiChunkQueue = [];
+        zaiDonePushing = false;
+        zaiPushError = null;
+
+        // Create a ReadableStream that will receive chunks from the browser
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+
+        // Start the fetch in the browser context
+        const browserPayload = JSON.stringify(payload);
+        const browserHeaders = JSON.stringify(headers);
+
+        // Fire-and-forget the browser fetch
+        zaiPage!.evaluate(async (args) => {
+          const { url, payload, headers } = args;
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: JSON.parse(headers),
+              body: payload,
+              credentials: 'include',
+            });
+
+            if (!res.ok || !res.body) {
+              const text = await res.text().catch(() => '');
+              (window as any).__zaiPushError(`HTTP ${res.status}: ${text.substring(0, 200)}`);
+              return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let chunkCount = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = decoder.decode(value, { stream: true });
+              chunkCount++;
+              if (chunkCount <= 3) {
+                console.log(`[zai-browser] Chunk ${chunkCount}:`, chunk.substring(0, 200));
+              }
+              (window as any).__zaiPushChunk(chunk);
+            }
+            console.log(`[zai-browser] Total chunks: ${chunkCount}`);
+            (window as any).__zaiPushDone();
+          } catch (e: any) {
+            (window as any).__zaiPushError(e.message);
+          }
+        }, { url, payload: browserPayload, headers: browserHeaders }).catch((err) => {
+          console.warn('[zai] Browser fetch error:', err.message);
+          zaiDonePushing = true;
+          zaiPushError = err;
         });
 
-        if (!response.ok || !response.body) {
-          const errText = await response.text().catch(() => '');
-          const kind = classifyZaiError(`HTTP ${response.status}: ${errText}`);
-          const retryable = response.status >= 500 ||
-            response.status === 429 ||
-            response.status === 408 ||
-            response.status === 405;
-          throw new ProviderError(
-            'zai',
-            `Chat request failed: ${response.status} - ${errText.substring(0, 200)}`,
-            response.status,
-            retryable,
-            kind
-          );
-        }
+        // Drain the chunk queue into the stream
+        (async () => {
+          try {
+            while (!zaiDonePushing || zaiChunkQueue.length > 0) {
+              if (zaiChunkQueue.length > 0) {
+                const chunks = zaiChunkQueue.splice(0);
+                for (const chunk of chunks) {
+                  await writer.write(new TextEncoder().encode(chunk));
+                }
+              } else {
+                await new Promise(r => setTimeout(r, 50));
+              }
+            }
+            await writer.close();
+          } catch (e) {
+            await writer.abort(e);
+          }
+        })();
 
         this._health.successCount++;
         this._health.consecutiveFailures = 0;
@@ -423,7 +480,7 @@ export class ZaiProvider implements ChatProvider {
         this._health.status = 'healthy';
 
         const promptTokens = Math.ceil(options.prompt.length / 3.5);
-        const events = this.createEventIterable(response.body);
+        const events = this.createEventIterable(readable);
 
         return { events, sessionId: chatId, promptTokens };
       });

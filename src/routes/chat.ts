@@ -83,7 +83,7 @@ function buildPrompt(body: OpenAIRequest): { prompt: string; messages: Message[]
     });
     const toolsJson = JSON.stringify(formattedTools, null, 2);
 
-    systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nRULES:\n1. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n2. Do NOT output any other text after your <tool_call> blocks. Wait for the user to provide the tool response.\n3. The JSON must be valid and accurately follow the tool's parameters.\n\n`;
+    systemPrompt += `\n\n# TOOLS AVAILABLE\nYou are running inside a coding agent. You do not directly see the user's filesystem, terminal, git history, or codebase unless you call tools. The client will execute your tool calls and send tool results back.\n\nYou have access to the following tools:\n${toolsJson}\n\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nRULES:\n1. If the user asks you to inspect, analyze, modify, review, or summarize a local project/codebase/repository, you MUST call the relevant filesystem/search/git tools instead of asking the user to paste files.\n2. Never say you cannot access local files while tools are available. Use tools first.\n3. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n4. Do NOT output any other text after your <tool_call> blocks. Wait for the tool response.\n5. The JSON must be valid and accurately follow the tool's parameters.\n\n`;
 
     if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
       const forcedTool = bodyAny.tool_choice.function.name;
@@ -135,6 +135,8 @@ async function handleStreamingResponse(
 
     let completionTokens = 0;
     let toolCallCount = 0;
+    let bufferedToolModeContent = '';
+    const shouldBufferContent = hasCallableTools(body);
 
     for await (const event of events) {
       switch (event.type) {
@@ -150,13 +152,17 @@ async function handleStreamingResponse(
           });
           break;
         case 'content':
-          await writeEvent({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: body.model,
-            choices: [makeChoice({ content: event.content })],
-          });
+          if (shouldBufferContent && toolCallCount === 0) {
+            bufferedToolModeContent += event.content || '';
+          } else {
+            await writeEvent({
+              id: completionId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: body.model,
+              choices: [makeChoice({ content: event.content })],
+            });
+          }
           break;
         case 'tool_call':
           toolCallCount++;
@@ -180,6 +186,28 @@ async function handleStreamingResponse(
       }
       if (event.completionTokens) {
         completionTokens = event.completionTokens;
+      }
+    }
+
+    if (shouldBufferContent && toolCallCount === 0) {
+      const syntheticToolCall = maybeCreateInspectionToolCall(body, bufferedToolModeContent);
+      if (syntheticToolCall) {
+        toolCallCount++;
+        await writeEvent({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [makeChoice({ tool_calls: [syntheticToolCall] })],
+        });
+      } else if (bufferedToolModeContent) {
+        await writeEvent({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [makeChoice({ content: bufferedToolModeContent })],
+        });
       }
     }
 
@@ -259,9 +287,19 @@ async function buildNonStreamingPayload(
     if (!accumulatedContent) {
       message.content = null;
     }
+  } else {
+    const syntheticToolCall = maybeCreateInspectionToolCall(body, accumulatedContent);
+    if (syntheticToolCall) {
+      message.tool_calls = [{
+        id: syntheticToolCall.id!,
+        type: 'function',
+        function: syntheticToolCall.function,
+      }];
+      message.content = null;
+    }
   }
 
-  const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+  const finishReason = message.tool_calls?.length > 0 ? 'tool_calls' : 'stop';
 
   return {
     id: completionId,
@@ -444,4 +482,129 @@ function setProviderHeaders(
 function stripInternalFields<T extends Record<string, any>>(payload: T): Omit<T, '_provider'> {
   const { _provider, ...rest } = payload;
   return rest;
+}
+
+function hasCallableTools(body: OpenAIRequest): boolean {
+  const tools = (body as any).tools;
+  return Array.isArray(tools) && tools.length > 0 && (body as any).tool_choice !== 'none';
+}
+
+function maybeCreateInspectionToolCall(body: OpenAIRequest, content: string) {
+  if (!hasCallableTools(body)) return null;
+
+  const lower = content.toLowerCase();
+  const looksLikeNoAccess =
+    lower.includes('não tenho acesso') ||
+    lower.includes('nao tenho acesso') ||
+    lower.includes('não consigo acessar') ||
+    lower.includes('nao consigo acessar') ||
+    lower.includes('compartilhar o código') ||
+    lower.includes('compartilhar o codigo') ||
+    lower.includes('copie e cole') ||
+    lower.includes('cole o resultado') ||
+    lower.includes('repositório comigo') ||
+    lower.includes('repositorio comigo') ||
+    lower.includes('sem que você me forneça') ||
+    lower.includes('sem que voce me forneca');
+
+  const userAskedForCodebase =
+    (body.messages || []).some(msg => {
+      if (msg.role !== 'user' || typeof msg.content !== 'string') return false;
+      const text = msg.content.toLowerCase();
+      return text.includes('codebase') ||
+        text.includes('code base') ||
+        text.includes('pasta') ||
+        text.includes('projeto') ||
+        text.includes('repo') ||
+        text.includes('reposit') ||
+        text.includes('últimas mudanças') ||
+        text.includes('ultimas mudanças') ||
+        text.includes('ultimas mudancas') ||
+        text.includes('verifica') ||
+        text.includes('analisa');
+    });
+
+  if (!looksLikeNoAccess && !userAskedForCodebase) return null;
+
+  const tool = chooseInspectionTool((body as any).tools);
+  if (!tool) return null;
+
+  return {
+    index: 0,
+    id: 'call_' + uuidv4(),
+    type: 'function',
+    function: {
+      name: tool.name,
+      arguments: JSON.stringify(tool.arguments),
+    },
+  };
+}
+
+function chooseInspectionTool(tools: any[]): { name: string; arguments: Record<string, unknown> } | null {
+  const candidates = tools
+    .filter(t => t?.type === 'function' && t.function?.name)
+    .map(t => ({
+      name: String(t.function.name),
+      parameters: t.function.parameters || { type: 'object', properties: {}, required: [] },
+    }));
+
+  if (candidates.length === 0) return null;
+
+  const preferred = [
+    /^(bash|shell|exec|run|terminal)$/i,
+    /(list|ls|glob|file|dir|tree)/i,
+    /(grep|search|rg)/i,
+  ];
+
+  let selected = candidates[0];
+  for (const pattern of preferred) {
+    const found = candidates.find(c => pattern.test(c.name));
+    if (found) {
+      selected = found;
+      break;
+    }
+  }
+
+  return {
+    name: selected.name,
+    arguments: buildInspectionArgs(selected.parameters, selected.name),
+  };
+}
+
+function buildInspectionArgs(parameters: any, toolName: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  const properties = parameters?.properties || {};
+  const required = Array.isArray(parameters?.required) ? parameters.required : Object.keys(properties);
+  const lowerTool = toolName.toLowerCase();
+
+  for (const key of required) {
+    const schema = properties[key] || {};
+    const lower = String(key).toLowerCase();
+
+    if (schema.default !== undefined) {
+      args[key] = schema.default;
+    } else if (schema.enum && Array.isArray(schema.enum) && schema.enum.length > 0) {
+      args[key] = schema.enum[0];
+    } else if (schema.type === 'number' || schema.type === 'integer') {
+      args[key] = lower.includes('limit') || lower.includes('max') ? 200 : 0;
+    } else if (schema.type === 'boolean') {
+      args[key] = false;
+    } else if (lower.includes('command') || lower === 'cmd' || lowerTool.includes('bash') || lowerTool.includes('shell')) {
+      args[key] = 'pwd && git status --short && find . -maxdepth 2 -type f | sed -n "1,200p"';
+    } else if (lower.includes('pattern') || lower.includes('glob')) {
+      args[key] = '**/*';
+    } else if (lower.includes('query') || lower.includes('search')) {
+      args[key] = 'package.json';
+    } else if (lower.includes('path') || lower.includes('dir') || lower.includes('cwd') || lower.includes('folder')) {
+      args[key] = '.';
+    } else {
+      args[key] = '';
+    }
+  }
+
+  if (Object.keys(args).length === 0 && (lowerTool.includes('bash') || lowerTool.includes('shell'))) {
+    args.command = 'pwd && git status --short && find . -maxdepth 2 -type f | sed -n "1,200p"';
+  }
+
+  return args;
 }
