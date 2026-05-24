@@ -1,12 +1,11 @@
-version: '3.8'
 services:
   deepsproxy:
     build: .
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:${PORT:-3000}"
     environment:
-      - PORT=3000
-      - API_KEY=sua_api_key_aqui
+      PORT: ${PORT:-3000}
+      API_KEY: ${API_KEY:-}
     volumes:
       - ./deepseek_profile:/app/deepseek_profile
     restart: unless-stopped
