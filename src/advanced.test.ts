@@ -163,7 +163,7 @@ test('caching-streaming and cache-control: returns prompt_tokens_details', async
   }
 });
 
-test('openai-requests-are-stateless: each request starts a fresh DeepSeek turn', async () => {
+test('matching OpenAI history reuses the DeepSeek session and sends only the new turn', async () => {
   let capturedPayloads: any[] = [];
 
   const restore = setupFetchMock((url, init) => {
@@ -209,7 +209,7 @@ test('openai-requests-are-stateless: each request starts a fresh DeepSeek turn',
         model: 'deepseek-v4-flash-thinking',
         messages: [
           { role: 'user', content: 'Turn 1' },
-          { role: 'assistant', content: 'Response 1' },
+          { role: 'assistant', content: 'hello' },
           { role: 'user', content: 'Turn 2' }
         ]
       })
@@ -222,16 +222,153 @@ test('openai-requests-are-stateless: each request starts a fresh DeepSeek turn',
     assert.strictEqual(capturedPayloads.length, 2);
     // In Turn 1, parent_message_id should be null (mock-session is fresh)
     assert.strictEqual(capturedPayloads[0].parent_message_id, null);
-    // OpenAI chat/completions requests are self-contained; the proxy must not
-    // reuse DeepSeek's previous parent_message_id because compressed or edited
-    // OpenAI histories no longer match the browser-side DeepSeek thread.
-    assert.strictEqual(capturedPayloads[1].parent_message_id, null, 'Turn 2 should start a fresh DeepSeek turn');
+    // The second OpenAI history extends the first request, so the proxy should
+    // reuse DeepSeek's server-side chat and thread from the first response.
+    assert.strictEqual(capturedPayloads[1].chat_session_id, capturedPayloads[0].chat_session_id);
+    assert.strictEqual(capturedPayloads[1].parent_message_id, 1001, 'Turn 2 should thread from the prior DeepSeek response');
     assert.strictEqual(
       capturedPayloads[1].prompt,
-      'User: Turn 1\n\nAssistant: Response 1\n\nUser: Turn 2\n\n',
-      'Should send complete message history'
+      'User: Turn 2\n\n',
+      'Should send only the new turn once DeepSeek already owns the earlier history'
     );
   } finally {
+    restore();
+  }
+});
+
+test('explicit session_id continues a DeepSeek session without replaying history', async () => {
+  const capturedPayloads: any[] = [];
+  const restore = setupFetchMock((_url, init) => {
+    capturedPayloads.push(JSON.parse(init?.body as string || '{}'));
+    const messageId = capturedPayloads.length === 1 ? 2101 : 2102;
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: {"v":{"response":{"message_id":${messageId}}}}\n\n`));
+        controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"ok"}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        controller.close();
+      }
+    }), { status: 200 });
+  });
+
+  try {
+    process.env.TEST_SESSION_ID = 'explicit-user-deepseek-chat';
+    const first = await app.fetch(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        session_id: 'hermes-session-42',
+        messages: [{ role: 'user', content: 'First turn' }],
+        stream: false,
+      })
+    }));
+    assert.strictEqual(first.status, 200);
+
+    const second = await app.fetch(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        session_id: 'hermes-session-42',
+        messages: [{ role: 'user', content: 'Second turn only' }],
+        stream: false,
+      })
+    }));
+    assert.strictEqual(second.status, 200);
+
+    assert.strictEqual(capturedPayloads[1].chat_session_id, capturedPayloads[0].chat_session_id);
+    assert.strictEqual(capturedPayloads[1].parent_message_id, 2101);
+    assert.strictEqual(capturedPayloads[1].prompt, 'User: Second turn only\n\n');
+  } finally {
+    delete process.env.TEST_SESSION_ID;
+    restore();
+  }
+});
+
+test('DeepSeek Pro disables web search because Expert mode does not support it', async () => {
+  let capturedPayload: any = null;
+  const restore = setupFetchMock((_url, init) => {
+    capturedPayload = JSON.parse(init?.body as string || '{}');
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"v":{"response":{"message_id":2201}}}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"ok"}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        controller.close();
+      }
+    }), { status: 200 });
+  });
+
+  try {
+    process.env.TEST_SESSION_ID = 'expert-search-disabled';
+    const response = await app.fetch(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'test' }],
+        stream: false,
+      })
+    }));
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(capturedPayload.search_enabled, false);
+  } finally {
+    delete process.env.TEST_SESSION_ID;
+    restore();
+  }
+});
+
+test('empty retry does not advance the DeepSeek parent before a valid response', async () => {
+  const capturedPayloads: any[] = [];
+  const restore = setupFetchMock((_url, init) => {
+    capturedPayloads.push(JSON.parse(init?.body as string || '{}'));
+    const attempt = capturedPayloads.length;
+    const messageId = attempt === 1 ? 3000 : attempt === 2 ? 3101 : attempt === 3 ? 3102 : 3103;
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: ready\ndata: {"response_message_id":${messageId}}\n\n`));
+        if (attempt !== 2) {
+          controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"ok"}\n\n'));
+        }
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        controller.close();
+      }
+    }), { status: 200 });
+  });
+
+  const request = (content: string) => app.fetch(new Request('http://localhost/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4-pro',
+      session_id: 'empty-parent-retry-key',
+      messages: [{ role: 'user', content }],
+      stream: false,
+    })
+  }));
+
+  try {
+    process.env.TEST_SESSION_ID = 'empty-parent-retry-session';
+    assert.strictEqual((await request('seed')).status, 200);
+    assert.strictEqual((await request('retry me')).status, 200);
+    assert.strictEqual((await request('after retry')).status, 200);
+
+    assert.strictEqual(capturedPayloads[0].parent_message_id, null);
+    assert.strictEqual(capturedPayloads[1].parent_message_id, 3000);
+    assert.strictEqual(
+      capturedPayloads[2].parent_message_id,
+      3000,
+      'An empty response must retry from the original parent'
+    );
+    assert.strictEqual(
+      capturedPayloads[3].parent_message_id,
+      3102,
+      'Only the successful response ID becomes the next parent'
+    );
+  } finally {
+    delete process.env.TEST_SESSION_ID;
     restore();
   }
 });
@@ -250,6 +387,7 @@ test('non-stream chat completion returns OpenAI JSON instead of SSE', async () =
   });
 
   try {
+    process.env.TEST_SESSION_ID = 'nonstream-session-id';
     const req = new Request('http://localhost/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -265,7 +403,9 @@ test('non-stream chat completion returns OpenAI JSON instead of SSE', async () =
     assert.strictEqual(body.choices[0].message.role, 'assistant');
     assert.strictEqual(body.choices[0].message.content, 'hello world');
     assert.strictEqual(body.choices[0].finish_reason, 'stop');
+    assert.strictEqual(body.session_id, 'nonstream-session-id');
   } finally {
+    delete process.env.TEST_SESSION_ID;
     restore();
   }
 });
@@ -466,21 +606,19 @@ test('compression: compressMessages trims older conversational history', async (
   assert.ok(compressed.length < messages.length);
 });
 
-test('telemetry and retry: reduces context limit on empty/error response and retries with compressed context', async () => {
+test('oversized prompt retries with compressed context after context overflow', async () => {
   let attempts: number[] = [];
+  const model = 'deepseek-v4-flash-thinking-overflow';
   const restore = setupFetchMock((url, init) => {
     const bodyObj = JSON.parse(init?.body as string || '{}');
     attempts.push(bodyObj.prompt.length);
-    
+
     if (bodyObj.prompt.length > 200) {
-      const stream = new ReadableStream({
-        start(c) {
-          c.close();
-        }
-      });
-      return new Response(stream, { status: 200 });
+      // Context overflow: DeepSeek rejects oversized prompts with an HTTP error
+      // that names the context limit, so the retry may compress safely.
+      return new Response(JSON.stringify({ error: "This model's maximum context length is 64 tokens" }), { status: 400 });
     }
-    
+
     const stream = new ReadableStream({
       start(c) {
         c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"compressed success"}\n\n'));
@@ -496,7 +634,7 @@ test('telemetry and retry: reduces context limit on empty/error response and ret
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'deepseek-v4-flash-thinking',
+        model,
         messages: [
           { role: 'system', content: 'Keep this instruction.' },
           { role: 'user', content: 'A'.repeat(300) },
@@ -504,22 +642,71 @@ test('telemetry and retry: reduces context limit on empty/error response and ret
         stream: false
       })
     });
-    
-    const { getModelTelemetry } = await import('./services/telemetry.ts');
-    const stats = getModelTelemetry('deepseek-v4-flash-thinking');
-    stats.detectedLimit = 400;
-    
+
     const res = await app.fetch(req);
     assert.strictEqual(res.status, 200);
-    
+
     const body = await res.json();
     assert.strictEqual(body.choices[0].message.content, 'compressed success');
-    
+
     assert.ok(attempts.length >= 2, 'Should have retried');
     assert.ok(attempts[1] < attempts[0], 'Second attempt prompt should be shorter due to compression');
-    
-    assert.ok(stats.minFailureSize < Infinity, 'Should have recorded a failure');
-    assert.ok(stats.detectedLimit < 400, 'Detected limit should be reduced');
+  } finally {
+    restore();
+  }
+});
+
+test('transport errors do not poison the model context estimate', async () => {
+  const model = 'deepseek-v4-pro-transport-error-test';
+  const { getModelTelemetry, getContextLength } = await import('./services/telemetry.ts');
+  const stats = getModelTelemetry(model);
+  const initialCharacters = stats.detectedLimit;
+  const initialTokens = getContextLength(model);
+  const restore = setupFetchMock(() => {
+    throw new Error('temporary network failure');
+  });
+
+  try {
+    const response = await app.fetch(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: false,
+      })
+    }));
+
+    assert.strictEqual(response.status, 500);
+    assert.strictEqual(stats.detectedLimit, initialCharacters);
+    assert.strictEqual(getContextLength(model), initialTokens);
+  } finally {
+    restore();
+  }
+});
+
+test('short empty responses do not collapse a healthy context estimate', async () => {
+  const model = 'deepseek-v4-pro-short-empty-test';
+  const { getModelTelemetry } = await import('./services/telemetry.ts');
+  const stats = getModelTelemetry(model);
+  const initialCharacters = stats.detectedLimit;
+  const restore = setupFetchMock(() => new Response(new ReadableStream({
+    start(controller) { controller.close(); }
+  }), { status: 200 }));
+
+  try {
+    const response = await app.fetch(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'tiny prompt' }],
+        stream: false,
+      })
+    }));
+
+    assert.strictEqual(response.status, 500);
+    assert.strictEqual(stats.detectedLimit, initialCharacters);
   } finally {
     restore();
   }

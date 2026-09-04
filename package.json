@@ -22,7 +22,7 @@
   "devDependencies": {
     "@types/node": "^25.6.2",
     "@types/uuid": "^10.0.0",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3"
   },
   "type": "module"

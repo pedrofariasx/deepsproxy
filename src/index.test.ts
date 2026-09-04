@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { app } from './index.ts';
-import { initPlaywright, closePlaywright } from './services/playwright.ts';
+import { app, resolveListenHost } from './index.ts';
+
+test('Server binds to loopback by default and allows an explicit host override', () => {
+  assert.strictEqual(resolveListenHost(undefined), '127.0.0.1');
+  assert.strictEqual(resolveListenHost('0.0.0.0'), '0.0.0.0');
+});
 
 test('Health check endpoint returns status ok', async () => {
   const req = new Request('http://localhost/health');
@@ -25,16 +29,30 @@ test('Models endpoint returns deepseek-v4-flash and deepseek-v4-flash-thinking',
   assert.ok(body.data.some((m: any) => m.id === 'deepseek-v4-flash'));
   assert.ok(body.data.some((m: any) => m.id === 'deepseek-v4-flash-thinking'));
   const flash = body.data.find((m: any) => m.id === 'deepseek-v4-flash');
-  assert.strictEqual(typeof flash.context_length, 'number');
-  assert.ok(flash.context_length > 0);
-  assert.strictEqual(typeof flash.max_context_tokens, 'number');
+  const pro = body.data.find((m: any) => m.id === 'deepseek-v4-pro');
+  assert.strictEqual(flash.context_length, 1_000_000);
+  assert.strictEqual(flash.max_context_tokens, 1_000_000);
+  assert.strictEqual(pro.context_length, 1_000_000);
+  assert.strictEqual(pro.max_context_tokens, 1_000_000);
 });
 
-test('Chat Completions endpoint with deepseek-v4-flash-thinking (thinking enabled)', async () => {
-  // Initialize playwright for this test
-  // NOTE: Headless mode can sometimes fail Cloudflare checks. We use headless=false for the test
-  // to ensure it matches the logged-in browser state if needed, or you can switch it to true.
-  await initPlaywright(false);
+test('Chat Completions maps DeepSeek thinking and content chunks deterministically', async () => {
+  const originalFetch = globalThis.fetch;
+  process.env.TEST_MOCK_PLAYWRIGHT = 'true';
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('chat.deepseek.com/api/v0/chat/completion')) {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"response_message_id":4101}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: {"p":"response/thinking_content","v":"reasoning"}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"answer"}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          controller.close();
+        }
+      }), { status: 200 });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
 
   try {
     const payload = {
@@ -98,6 +116,7 @@ test('Chat Completions endpoint with deepseek-v4-flash-thinking (thinking enable
     assert.ok(hasReasoning, 'Should have received streamed chunks with reasoning_content (Thinking enabled)');
     assert.ok(hasContent, 'Should have received streamed chunks with content');
   } finally {
-    await closePlaywright();
+    globalThis.fetch = originalFetch;
+    delete process.env.TEST_MOCK_PLAYWRIGHT;
   }
 });

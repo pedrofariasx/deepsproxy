@@ -14,14 +14,24 @@ import { cors } from 'hono/cors';
 import { chatCompletions } from './routes/chat.ts';
 import * as dotenv from 'dotenv';
 import { initPlaywright } from './services/playwright.ts';
-import { getContextLength } from './services/telemetry.ts';
 
 dotenv.config();
 
 export const app = new Hono();
 
+export function resolveListenHost(value?: string): string {
+  return value?.trim() || '127.0.0.1';
+}
+
+export function assertSafeListenConfig(host: string, apiKey?: string): void {
+  const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost']);
+  if (!loopbackHosts.has(host) && !apiKey?.trim()) {
+    throw new Error('API_KEY is required when HOST is not a loopback address');
+  }
+}
+
 function modelEntry(id: string) {
-  const dynamicLimit = getContextLength(id);
+  const contextWindow = 1_000_000;
   return {
     id,
     object: 'model',
@@ -30,9 +40,9 @@ function modelEntry(id: string) {
     permission: [],
     root: id,
     parent: null,
-    context_length: dynamicLimit,
-    max_context_tokens: dynamicLimit,
-    max_input_tokens: dynamicLimit,
+    context_length: contextWindow,
+    max_context_tokens: contextWindow,
+    max_input_tokens: contextWindow,
     max_output_tokens: 8_000,
   };
 }
@@ -73,7 +83,20 @@ app.get('/v1/models', (c) => {
 // Initialize playwright when server starts
 import { fileURLToPath } from 'url';
 
+const handleOutputError = (error: any) => {
+  if (error?.code !== 'EPIPE') throw error;
+};
+process.stdout?.on('error', handleOutputError);
+process.stderr?.on('error', handleOutputError);
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const host = resolveListenHost(process.env.HOST);
+  try {
+    assertSafeListenConfig(host, process.env.API_KEY);
+  } catch (error) {
+    console.error(error);
+    process.exit(1);
+  }
   initPlaywright().then(() => {
     console.log('Playwright initialized.');
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -81,7 +104,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
     serve({
       fetch: app.fetch,
-      port
+      port,
+      hostname: host
     });
   }).catch((err: any) => {
     console.error('Failed to initialize playwright:', err);

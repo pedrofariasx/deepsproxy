@@ -9,13 +9,21 @@
  */
 
 import { Context } from 'hono';
-import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
 import { createDeepSeekStream, updateSessionParent } from '../services/deepseek.ts';
 import { OpenAIRequest, ChoiceDelta, Message, ToolCall, Usage } from '../utils/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
-import { getModelTelemetry, recordSuccess, recordFailure } from '../services/telemetry.ts';
+import { getModelTelemetry, recordSuccess, recordFailure, isContextOverflowError } from '../services/telemetry.ts';
 import { compressMessages } from '../utils/compression.ts';
+import {
+  acquireSessionLease,
+  findExplicitSession,
+  findLineageSession,
+  incrementalMessages,
+  registerExplicitSession,
+  registerLineageSession,
+  unregisterExplicitSession,
+} from '../services/hybrid-sessions.ts';
 
 const TOOL_START = '<tool_call>';
 const TOOL_END = '</tool_call>';
@@ -29,6 +37,7 @@ interface ParsedCompletion {
   toolCalls: ToolCall[];
   finishReason: string;
   usage: Usage;
+  responseMessageId: number | null;
 }
 
 function messageContentToString(content: any): string {
@@ -239,11 +248,12 @@ async function parseDeepSeekStreamToOpenAI(
   completionId: string,
   model: string,
   promptTokens: number,
-  uiSessionId: string,
+  _uiSessionId: string,
   tools: any[] = [],
-  emit?: EmitChunk
+  emit?: EmitChunk,
+  existingReader?: ReadableStreamDefaultReader<any>
 ): Promise<ParsedCompletion> {
-  const reader = deepSeekStream.getReader();
+  const reader = existingReader || deepSeekStream.getReader();
   const decoder = new TextDecoder();
 
   let currentAppendPath = '';
@@ -258,6 +268,7 @@ async function parseDeepSeekStreamToOpenAI(
   const toolCalls: ToolCall[] = [];
   let buffer = '';
   let pendingToolLeadIn = '';
+  let responseMessageId: number | null = null;
 
   const emitContent = async (text: string) => {
     if (!text || emittedToolCallCount > 0) return;
@@ -317,7 +328,67 @@ async function parseDeepSeekStreamToOpenAI(
     emittedToolCallCount++;
   };
 
-  while (true) {
+  const processResponseText = async (text: string, fragmentType?: string) => {
+    if (!text || text === 'FINISHED') return;
+    const isThinking = fragmentType === 'THINK' || (
+      fragmentType === undefined && (
+        currentAppendPath.includes('thinking_content') ||
+        currentAppendPath.includes('THINK') ||
+        (currentAppendPath.includes('fragments/-1/content') && currentFragmentType === 'THINK')
+      )
+    );
+
+    if (isThinking) {
+      reasoningContent += text;
+      const delta: ChoiceDelta = { reasoning_content: text };
+      if (emit) await emit(makeChunk(completionId, model, delta));
+      return;
+    }
+
+    contentEmitBuffer += text;
+    while (contentEmitBuffer.length > 0) {
+      if (!insideTool) {
+        const toolOpen = findToolOpen(contentEmitBuffer);
+        if (toolOpen) {
+          pendingToolLeadIn += contentEmitBuffer.substring(0, toolOpen.startIdx);
+          insideTool = true;
+          currentToolOpenTag = toolOpen.openTag;
+          contentEmitBuffer = contentEmitBuffer.substring(toolOpen.endIdx);
+          continue;
+        }
+
+        const partialStartIdx = findPartialToolOpenIndex(contentEmitBuffer);
+        const flushIndex = partialStartIdx === -1 ? contentEmitBuffer.length : partialStartIdx;
+        const textToEmit = contentEmitBuffer.substring(0, flushIndex);
+        await emitContent(textToEmit);
+        contentEmitBuffer = contentEmitBuffer.substring(flushIndex);
+        break;
+      }
+
+      const lowerBuffer = contentEmitBuffer.toLowerCase();
+      const endIdx = lowerBuffer.indexOf(TOOL_END);
+      if (endIdx === -1) break;
+
+      const toolBlock = contentEmitBuffer.substring(0, endIdx).trim();
+      try {
+        await emitToolCallFromBlock(toolBlock, currentToolOpenTag);
+        pendingToolLeadIn = '';
+      } catch (error) {
+        console.warn('[chat] Dropping malformed tool call block:', error);
+        if (emittedToolCallCount === 0 && pendingToolLeadIn.trim().length > 0) {
+          await emitContent(pendingToolLeadIn);
+        }
+        pendingToolLeadIn = '';
+      }
+
+      insideTool = false;
+      currentToolOpenTag = TOOL_START;
+      contentEmitBuffer = contentEmitBuffer.substring(endIdx + TOOL_END.length);
+    }
+  };
+
+  try {
+    while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -347,11 +418,10 @@ async function parseDeepSeekStreamToOpenAI(
           dsMessageId = chunk.message_id;
         }
 
-        if (dsMessageId) updateSessionParent(uiSessionId, dsMessageId);
-
-        let vStr = '';
-        let foundStr = false;
-        let isThinkingChunk = false;
+        // Do not commit the parent here. DeepSeek can emit a message ID for an
+        // empty/failed generation; committing it would make retries continue
+        // from a broken turn instead of branching from the last valid parent.
+        if (typeof dsMessageId === 'number') responseMessageId = dsMessageId;
 
         if (typeof chunk.p === 'string') {
           currentAppendPath = chunk.p;
@@ -360,96 +430,19 @@ async function parseDeepSeekStreamToOpenAI(
           }
         }
 
-        if (typeof chunk.v === 'string') {
-          vStr = chunk.v;
-          foundStr = true;
-        } else if (chunk.v && typeof chunk.v === 'object') {
-          if (chunk.v.response && chunk.v.response.fragments && chunk.v.response.fragments.length > 0) {
-            const frag = chunk.v.response.fragments[0];
-            if (typeof frag.content === 'string') {
-              vStr = frag.content;
-              foundStr = true;
-              currentAppendPath = frag.type === 'THINK' ? 'response/thinking_content' : 'response/content';
-              currentFragmentType = frag.type || '';
-            }
-          } else if (Array.isArray(chunk.v) && chunk.v.length > 0) {
-            const firstObj = chunk.v[0];
-            if (typeof firstObj.content === 'string') {
-              vStr = firstObj.content;
-              foundStr = true;
-              currentAppendPath = firstObj.type === 'THINK' ? 'response/thinking_content' : 'response/content';
-              currentFragmentType = firstObj.type || '';
+        const fragments = Array.isArray(chunk.v)
+          ? chunk.v
+          : (Array.isArray(chunk.v?.response?.fragments) ? chunk.v.response.fragments : null);
+        if (fragments) {
+          const lastFragment = fragments[fragments.length - 1];
+          if (lastFragment?.type) currentFragmentType = lastFragment.type;
+          for (const fragment of fragments) {
+            if (typeof fragment?.content === 'string') {
+              await processResponseText(fragment.content, fragment.type);
             }
           }
-        }
-
-        if (chunk.p === 'response/fragments' && Array.isArray(chunk.v)) {
-          const lastFrag = chunk.v[chunk.v.length - 1];
-          if (lastFrag && lastFrag.type) currentFragmentType = lastFrag.type;
-        }
-
-        if (currentAppendPath.includes('thinking_content') ||
-            currentAppendPath.includes('THINK') ||
-            (currentAppendPath.includes('fragments/-1/content') && currentFragmentType === 'THINK')) {
-          isThinkingChunk = true;
-        }
-
-        if (!foundStr || vStr === '' || vStr === 'FINISHED') continue;
-
-        if (isThinkingChunk) {
-          reasoningContent += vStr;
-          const delta: ChoiceDelta = { reasoning_content: vStr };
-          if (emit) await emit(makeChunk(completionId, model, delta));
-          continue;
-        }
-
-        contentEmitBuffer += vStr;
-
-        while (contentEmitBuffer.length > 0) {
-          if (!insideTool) {
-            const toolOpen = findToolOpen(contentEmitBuffer);
-            if (toolOpen) {
-              // Once a tool call appears, do not emit the lead-in text as
-              // assistant content. OpenAI-compatible clients expect the whole
-              // assistant turn to be a structured tool_calls message.
-              pendingToolLeadIn += contentEmitBuffer.substring(0, toolOpen.startIdx);
-              insideTool = true;
-              currentToolOpenTag = toolOpen.openTag;
-              contentEmitBuffer = contentEmitBuffer.substring(toolOpen.endIdx);
-              continue;
-            }
-
-            const partialStartIdx = findPartialToolOpenIndex(contentEmitBuffer);
-            const flushIndex = partialStartIdx === -1 ? contentEmitBuffer.length : partialStartIdx;
-
-            const textToEmit = contentEmitBuffer.substring(0, flushIndex);
-            await emitContent(textToEmit);
-            contentEmitBuffer = contentEmitBuffer.substring(flushIndex);
-            break;
-          }
-
-          const lowerBuffer = contentEmitBuffer.toLowerCase();
-          const endIdx = lowerBuffer.indexOf(TOOL_END);
-          if (endIdx === -1) break;
-
-          const toolBlock = contentEmitBuffer.substring(0, endIdx).trim();
-          try {
-            await emitToolCallFromBlock(toolBlock, currentToolOpenTag);
-            pendingToolLeadIn = '';
-          } catch (e) {
-            // Never leak internal tool-call XML to the user-visible content.
-            // If the call cannot be parsed, restore any normal text that came
-            // before it so the OpenAI response is not silently empty.
-            console.warn('[chat] Dropping malformed tool call block:', e);
-            if (emittedToolCallCount === 0 && pendingToolLeadIn.trim().length > 0) {
-              await emitContent(pendingToolLeadIn);
-            }
-            pendingToolLeadIn = '';
-          }
-
-          insideTool = false;
-          currentToolOpenTag = TOOL_START;
-          contentEmitBuffer = contentEmitBuffer.substring(endIdx + TOOL_END.length);
+        } else if (typeof chunk.v === 'string') {
+          await processResponseText(chunk.v);
         }
       } catch (e) {
         // Ignore partial or malformed DeepSeek chunks.
@@ -486,43 +479,94 @@ async function parseDeepSeekStreamToOpenAI(
     reasoningContent,
     toolCalls,
     finishReason: emittedToolCallCount > 0 ? 'tool_calls' : 'stop',
-    usage
+    usage,
+    responseMessageId
   };
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+}
+
+function hasSemanticDeepSeekEvent(data: any, state: { path: string }): boolean {
+  if (typeof data?.p === 'string') state.path = data.p;
+  const value = data?.v;
+  if (typeof value === 'string') {
+    if (!value || value === 'FINISHED') return false;
+    return state.path.includes('content') || data?.o === 'APPEND';
+  }
+  const fragments = value?.response?.fragments;
+  if (Array.isArray(fragments)) {
+    return fragments.some((fragment: any) => typeof fragment?.content === 'string' && fragment.content.length > 0);
+  }
+  if (Array.isArray(value)) {
+    return value.some((fragment: any) => typeof fragment?.content === 'string' && fragment.content.length > 0);
+  }
+  return false;
 }
 
 async function peekStream(stream: ReadableStream): Promise<{ isEmpty: boolean; peekedStream: ReadableStream }> {
   const reader = stream.getReader();
+  const bufferedChunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  const state = { path: '' };
+  let lineBuffer = '';
+
   try {
-    const { done, value } = await reader.read();
-    if (done) {
-      return { isEmpty: true, peekedStream: new ReadableStream({ start(c) { c.close(); } }) };
-    }
-    
-    const peekedStream = new ReadableStream({
-      async start(controller) {
-        controller.enqueue(value);
-        try {
-          while (true) {
-            const { done: nextDone, value: nextValue } = await reader.read();
-            if (nextDone) {
-              controller.close();
-              break;
-            }
-            controller.enqueue(nextValue);
-          }
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-      cancel() {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
         reader.releaseLock();
+        return { isEmpty: true, peekedStream: new ReadableStream({ start(controller) { controller.close(); } }) };
       }
-    });
-    
-    return { isEmpty: false, peekedStream };
-  } catch (err) {
-    reader.releaseLock();
-    throw err;
+
+      bufferedChunks.push(value);
+      lineBuffer += decoder.decode(value, { stream: true });
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() || '';
+      let semantic = false;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const raw = trimmed.slice(6);
+        if (raw === '[DONE]') continue;
+        try {
+          if (hasSemanticDeepSeekEvent(JSON.parse(raw), state)) {
+            semantic = true;
+            break;
+          }
+        } catch {}
+      }
+
+      if (!semantic) continue;
+      const peekedStream = new ReadableStream({
+        async start(controller) {
+          for (const chunk of bufferedChunks) controller.enqueue(chunk);
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) {
+                controller.close();
+                break;
+              }
+              controller.enqueue(next.value);
+            }
+          } catch (error) {
+            controller.error(error);
+          }
+        },
+        async cancel(reason) {
+          await reader.cancel(reason);
+        }
+      });
+      return { isEmpty: false, peekedStream };
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    try { reader.releaseLock(); } catch {}
+    throw error;
   }
 }
 
@@ -531,6 +575,105 @@ export async function chatCompletions(c: Context) {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
     const messages = body.messages || [];
+    const bodyAny = body as any;
+    const explicitSessionKey = (
+      typeof bodyAny.session_id === 'string' && bodyAny.session_id.trim()
+        ? bodyAny.session_id.trim()
+        : (c.req.header('x-deeps-session') || c.req.header('x-session-id') || undefined)
+    );
+    const initialSession = findExplicitSession(explicitSessionKey) || findLineageSession(messages);
+    let hybridSession = initialSession;
+    let releaseBootstrapLock: (() => void) | undefined;
+    let releaseSessionLock: (() => void) | undefined;
+    let heldCanonicalSessionId: string | undefined;
+    let lockTransferredToStream = false;
+
+    try {
+      // Unknown explicit keys serialize their bootstrap. Once the first request
+      // registers a chat, queued requests migrate to that chat's canonical lock.
+      if (!hybridSession && explicitSessionKey) {
+        releaseBootstrapLock = await acquireSessionLease(`explicit:${explicitSessionKey}`);
+        if (!releaseBootstrapLock) {
+          c.header('Retry-After', '1');
+          return c.json({ error: { message: 'Timed out waiting for the conversation session', type: 'rate_limit_exceeded', code: 'session_busy' } }, 429);
+        }
+        hybridSession = findExplicitSession(explicitSessionKey) || findLineageSession(messages);
+      }
+
+      if (hybridSession) {
+        releaseSessionLock = await acquireSessionLease(`chat:${hybridSession.chatSessionId}`);
+        if (!releaseSessionLock) {
+          c.header('Retry-After', '1');
+          return c.json({ error: { message: 'Timed out waiting for the conversation session', type: 'rate_limit_exceeded', code: 'session_busy' } }, 429);
+        }
+        heldCanonicalSessionId = hybridSession.chatSessionId;
+        releaseBootstrapLock?.();
+        releaseBootstrapLock = undefined;
+        // Re-read after waiting: an earlier request may have advanced the chat.
+        hybridSession = findExplicitSession(explicitSessionKey) || findLineageSession(messages);
+      } else {
+        releaseSessionLock = releaseBootstrapLock;
+        releaseBootstrapLock = undefined;
+      }
+
+      const outboundMessages = hybridSession
+        ? (hybridSession.matchedLength !== undefined
+            ? messages.slice(hybridSession.matchedLength)
+            : incrementalMessages(messages))
+        : messages;
+      const response = await chatCompletionsHybrid(
+        c, body, messages, outboundMessages,
+        hybridSession, explicitSessionKey,
+        isStream ? releaseSessionLock : undefined,
+        isStream ? heldCanonicalSessionId : undefined
+      );
+      lockTransferredToStream = isStream && !!releaseSessionLock;
+      return response;
+    } finally {
+      releaseBootstrapLock?.();
+      if (!lockTransferredToStream) releaseSessionLock?.();
+    }
+  } catch (err: any) {
+    console.error('Error in chatCompletions dispatch:', err);
+    const message = err?.message || String(err);
+    const upstreamStatus = Number(err?.upstreamStatus);
+    let status = err?.upstreamStatus === undefined
+      ? 500
+      : (Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599 ? upstreamStatus : 502);
+    let code = status === 429 ? 'rate_limit_exceeded' : 'upstream_error';
+    if (/account is suspended/i.test(message)) {
+      status = 403;
+      code = 'deepseek_account_suspended';
+    } else if (/login is required/i.test(message)) {
+      status = 401;
+      code = 'deepseek_login_required';
+    } else if (/chat input unavailable|Timeout waiting for chat input/i.test(message)) {
+      status = 409;
+      code = 'deepseek_chat_unavailable';
+    }
+    return c.json({ error: { message, type: code, code } }, status as any);
+  }
+}
+
+function isNonRetryableFailure(error: any): boolean {
+  const status = error?.upstreamStatus;
+  const message = error?.message || String(error);
+  return status === 401 || status === 403 || status === 429 || status === 503 || status === 504 ||
+    /account is suspended|login is required|chat input unavailable|Timeout waiting for chat input/i.test(message);
+}
+
+async function chatCompletionsHybrid(
+  c: Context,
+  body: OpenAIRequest,
+  messages: any[],
+  outboundMessages: any[],
+  hybridSession: { chatSessionId: string; parentMessageId: number | null; matchedLength?: number } | undefined,
+  explicitSessionKey: string | undefined,
+  releaseSessionLock?: () => void,
+  heldCanonicalSessionId?: string
+) {
+  const isStream = body.stream ?? false;
+  const canPublishLineage = !hybridSession || hybridSession.matchedLength !== undefined;
 
     const isThinkingModel = body.model.includes('thinking');
     const isProModel = body.model.includes('pro');
@@ -548,7 +691,7 @@ export async function chatCompletions(c: Context) {
         const telemetry = getModelTelemetry(body.model);
         const currentTargetLimit = telemetry.detectedLimit;
         
-        const compressed = compressMessages(messages, currentTargetLimit, serializeOpenAIMessages);
+        const compressed = compressMessages(outboundMessages, currentTargetLimit, serializeOpenAIMessages);
         const serialized = serializeOpenAIMessages(compressed);
         const systemPrompt = appendToolInstructions(serialized.systemPrompt, body);
         const finalPrompt = systemPrompt ? `${systemPrompt}\n${serialized.prompt}` : serialized.prompt;
@@ -557,7 +700,13 @@ export async function chatCompletions(c: Context) {
 
         try {
           console.log(`[Chat] Attempt ${attempt}/${maxAttempts} (non-stream) with prompt length ${promptSize} chars.`);
-          const result = await createDeepSeekStream(finalPrompt, isThinkingModel, isProModel, null);
+          const result = await createDeepSeekStream(
+            finalPrompt,
+            isThinkingModel,
+            isProModel,
+            hybridSession ? hybridSession.parentMessageId : null,
+            hybridSession?.chatSessionId
+          );
           
           const parsed = await parseDeepSeekStreamToOpenAI(
             result.stream,
@@ -568,13 +717,19 @@ export async function chatCompletions(c: Context) {
             (body as any).tools || []
           );
 
-          if (parsed.content === '' && parsed.toolCalls.length === 0) {
+          if (parsed.content === '' && parsed.reasoningContent === '' && parsed.toolCalls.length === 0) {
             console.warn(`[Chat] Attempt ${attempt} (non-stream) response was empty.`);
-            recordFailure(body.model, promptSize);
+            if (attempt >= maxAttempts) {
+              lastError = new Error("Failed to get a non-empty response from DeepSeek after multiple attempts.");
+              break;
+            }
             continue;
           }
 
           // Success!
+          if (parsed.responseMessageId !== null) {
+            updateSessionParent(result.uiSessionId, parsed.responseMessageId);
+          }
           recordSuccess(body.model, promptSize);
           parsedResult = parsed;
           finalUiSessionId = result.uiSessionId;
@@ -582,8 +737,10 @@ export async function chatCompletions(c: Context) {
         } catch (err: any) {
           console.error(`[Chat] Attempt ${attempt} (non-stream) failed:`, err.message);
           lastError = err;
-          recordFailure(body.model, promptSize);
-          if (attempt >= maxAttempts) {
+          if (isContextOverflowError(err)) {
+            recordFailure(body.model, promptSize);
+          }
+          if (isNonRetryableFailure(err) || attempt >= maxAttempts) {
             break;
           }
           await new Promise(r => setTimeout(r, 1000));
@@ -600,12 +757,18 @@ export async function chatCompletions(c: Context) {
       };
       if (parsedResult.reasoningContent) message.reasoning_content = parsedResult.reasoningContent;
       if (parsedResult.toolCalls.length > 0) message.tool_calls = parsedResult.toolCalls;
+      if (parsedResult.responseMessageId !== null) {
+        if (canPublishLineage) registerLineageSession([...messages, message], finalUiSessionId, parsedResult.responseMessageId);
+        registerExplicitSession(explicitSessionKey, finalUiSessionId, parsedResult.responseMessageId);
+        registerExplicitSession(finalUiSessionId, finalUiSessionId, parsedResult.responseMessageId);
+      }
 
       return c.json({
         id: completionId,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: body.model,
+        session_id: finalUiSessionId,
         choices: [{
           index: 0,
           message,
@@ -623,13 +786,15 @@ export async function chatCompletions(c: Context) {
     const maxAttempts = 3;
     let lastError: any = null;
     let promptSizeUsed = 0;
+    let releaseCanonicalStreamLock: (() => void) | undefined;
+    let provisionalSessionPublished = false;
 
     while (attempt < maxAttempts) {
       attempt++;
       const telemetry = getModelTelemetry(body.model);
       const currentTargetLimit = telemetry.detectedLimit;
       
-      const compressed = compressMessages(messages, currentTargetLimit, serializeOpenAIMessages);
+      const compressed = compressMessages(outboundMessages, currentTargetLimit, serializeOpenAIMessages);
       const serialized = serializeOpenAIMessages(compressed);
       const systemPrompt = appendToolInstructions(serialized.systemPrompt, body);
       const finalPrompt = systemPrompt ? `${systemPrompt}\n${serialized.prompt}` : serialized.prompt;
@@ -637,13 +802,22 @@ export async function chatCompletions(c: Context) {
 
       try {
         console.log(`[Chat] Attempt ${attempt}/${maxAttempts} (stream) with prompt length ${promptSizeUsed} chars.`);
-        const result = await createDeepSeekStream(finalPrompt, isThinkingModel, isProModel, null);
+        const result = await createDeepSeekStream(
+            finalPrompt,
+            isThinkingModel,
+            isProModel,
+            hybridSession ? hybridSession.parentMessageId : null,
+            hybridSession?.chatSessionId
+          );
         
         // Peek the stream to verify it has content
         const { isEmpty, peekedStream } = await peekStream(result.stream);
         if (isEmpty) {
           console.warn(`[Chat] Attempt ${attempt} (stream) peeked stream was empty.`);
-          recordFailure(body.model, promptSizeUsed);
+          if (attempt >= maxAttempts) {
+            lastError = new Error("Failed to get a valid stream from DeepSeek after multiple attempts.");
+            break;
+          }
           continue;
         }
 
@@ -655,8 +829,10 @@ export async function chatCompletions(c: Context) {
       } catch (err: any) {
         console.error(`[Chat] Attempt ${attempt} (stream) failed:`, err.message);
         lastError = err;
-        recordFailure(body.model, promptSizeUsed);
-        if (attempt >= maxAttempts) {
+        if (isContextOverflowError(err)) {
+          recordFailure(body.model, promptSizeUsed);
+        }
+        if (isNonRetryableFailure(err) || attempt >= maxAttempts) {
           break;
         }
         await new Promise(r => setTimeout(r, 1000));
@@ -667,49 +843,116 @@ export async function chatCompletions(c: Context) {
       throw lastError || new Error("Failed to get a valid stream from DeepSeek after multiple attempts.");
     }
 
+    // A bootstrap initially owns explicit:<key>. Acquire the canonical chat lock
+    // before the chat can be registered under lineage/other aliases, and hold
+    // both leases until the client stream completes or is cancelled.
+    if (!hybridSession && uiSessionId) {
+      if (heldCanonicalSessionId !== uiSessionId) {
+        releaseCanonicalStreamLock = await acquireSessionLease(`chat:${uiSessionId}`);
+        if (!releaseCanonicalStreamLock) {
+          await deepSeekStream.cancel(new Error('Timed out waiting for the canonical session lease')).catch(() => {});
+          const error: any = new Error('Timed out waiting for the conversation session');
+          error.upstreamStatus = 429;
+          throw error;
+        }
+      }
+      registerExplicitSession(uiSessionId, uiSessionId, null);
+      provisionalSessionPublished = true;
+    }
+
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
+    c.header('x-deeps-session', uiSessionId);
+    c.header('Access-Control-Expose-Headers', 'x-deeps-session');
 
     const promptTokens = Math.ceil(promptSizeUsed / 3.5);
 
-    return honoStream(c, async (streamWriter: any) => {
-      const writeEvent = async (data: any) => {
-        await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
-      };
+    const downstreamAbort = new AbortController();
+    const deepSeekReader = deepSeekStream.getReader();
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanup = (reason: any = new Error('Proxy stream closed')): Promise<void> => {
+      if (!cleanupPromise) {
+        cleanupPromise = (async () => {
+          if (!downstreamAbort.signal.aborted) downstreamAbort.abort(reason);
+          await deepSeekReader.cancel(reason).catch(() => {});
+          if (provisionalSessionPublished) {
+            unregisterExplicitSession(uiSessionId, uiSessionId, true);
+          }
+          releaseSessionLock?.();
+          releaseCanonicalStreamLock?.();
+        })();
+      }
+      return cleanupPromise;
+    };
+    const encoder = new TextEncoder();
+    const responseStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const writeEvent = async (data: any) => {
+          if (downstreamAbort.signal.aborted) throw downstreamAbort.signal.reason;
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        };
+        void (async () => {
+          try {
+            await writeEvent(makeChunk(completionId, body.model, { role: 'assistant', content: '' }));
 
-      await writeEvent(makeChunk(completionId, body.model, { role: 'assistant', content: '' }));
+            const parsed = await parseDeepSeekStreamToOpenAI(
+              deepSeekStream!,
+              completionId,
+              body.model,
+              promptTokens,
+              uiSessionId,
+              (body as any).tools || [],
+              writeEvent,
+              deepSeekReader
+            );
 
-      const parsed = await parseDeepSeekStreamToOpenAI(
-        deepSeekStream!,
-        completionId,
-        body.model,
-        promptTokens,
-        uiSessionId,
-        (body as any).tools || [],
-        writeEvent
-      );
+            if (
+              !downstreamAbort.signal.aborted &&
+              parsed.responseMessageId !== null &&
+              (parsed.content !== '' || parsed.reasoningContent !== '' || parsed.toolCalls.length > 0)
+            ) {
+              updateSessionParent(uiSessionId, parsed.responseMessageId);
+              const assistantMessage: any = {
+                role: 'assistant',
+                content: parsed.toolCalls.length > 0 ? null : parsed.content,
+              };
+              if (parsed.reasoningContent) assistantMessage.reasoning_content = parsed.reasoningContent;
+              if (parsed.toolCalls.length > 0) assistantMessage.tool_calls = parsed.toolCalls;
+              if (canPublishLineage) registerLineageSession([...messages, assistantMessage], uiSessionId, parsed.responseMessageId);
+              registerExplicitSession(explicitSessionKey, uiSessionId, parsed.responseMessageId);
+              registerExplicitSession(uiSessionId, uiSessionId, parsed.responseMessageId);
+            }
 
-      await writeEvent(makeChunk(completionId, body.model, {}, parsed.finishReason, parsed.usage));
-      await streamWriter.write('data: [DONE]\n\n');
+            await writeEvent(makeChunk(completionId, body.model, {}, parsed.finishReason, parsed.usage));
+            if (!downstreamAbort.signal.aborted) {
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            }
+          } catch (error: any) {
+            if (!downstreamAbort.signal.aborted) {
+              const code = error?.upstreamStatus === 504 ? 'upstream_timeout' : 'upstream_stream_error';
+              try {
+                await writeEvent({
+                  error: {
+                    message: error?.message || String(error),
+                    type: code,
+                    code,
+                  }
+                });
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                controller.close();
+              } catch {}
+            }
+          } finally {
+            await cleanup();
+          }
+        })();
+      },
+      async cancel(reason) {
+        await cleanup(reason || new Error('Downstream client disconnected'));
+      }
     });
-  } catch (err: any) {
-    console.error('Error in chatCompletions:', err);
-    const errMessage = err?.message || String(err);
 
-    let status = 500;
-    let code = 'upstream_error';
-    if (/account is suspended/i.test(errMessage)) {
-      status = 403;
-      code = 'deepseek_account_suspended';
-    } else if (/login is required/i.test(errMessage)) {
-      status = 401;
-      code = 'deepseek_login_required';
-    } else if (/chat input unavailable|Timeout waiting for chat input/i.test(errMessage)) {
-      status = 409;
-      code = 'deepseek_chat_unavailable';
-    }
-
-    return c.json({ error: { message: errMessage, type: code, code } }, status as any);
-  }
+    return c.body(responseStream as any);
 }

@@ -15,6 +15,8 @@ Proxy API local compatível com OpenAI que roteia requisições para modelos Dee
 - **OpenAI API Compatible**: Interface compatível com `/v1/chat/completions` e `/v1/models`
 - **Tool Execution**: Sistema de ferramentas executáveis via Playwright
 - **Session Persistence**: Login persistente com armazenamento de perfil do navegador
+- **Long-Context Sessions**: Reutiliza `chat_session_id` e `parent_message_id`, enviando apenas os turnos novos ao continuar uma conversa
+- **Safe Concurrency**: Serializa geração de PoW e continuações por sessão, inclusive até o encerramento de streams
 - **Authentication**: Suporte opcional a API Key via header `Authorization` ou `X-API-Key`
 - **Type-Safe**: Código 100% TypeScript com strict mode
 - **Docker Ready**: Deploy simplificado com Docker Compose
@@ -88,12 +90,26 @@ Crie o arquivo `.env` na raiz do projeto:
 # Porta do servidor (default: 3000)
 PORT=3000
 
-# Chave de API para proteger endpoints (opcional)
+# Interface HTTP (default seguro: apenas loopback)
+HOST=127.0.0.1
+
+# Chave de API para proteger endpoints (obrigatória se HOST não for loopback)
 API_KEY=sua-chave-secreta-aqui
 
 # Configurações Playwright
 PLAYWRIGHT_HEADLESS=true
 PLAYWRIGHT_TIMEOUT=30000
+
+# Fila/tempo máximo total para capturar PoW (inclui espera na fila)
+DEEPSPROXY_POW_QUEUE_MAX=32
+DEEPSPROXY_POW_TIMEOUT_MS=30000
+DEEPSPROXY_POW_CLEANUP_GRACE_MS=1000
+
+# Deadline total de cada stream upstream (ms)
+DEEPSPROXY_UPSTREAM_TIMEOUT_MS=300000
+
+# Tempo máximo aguardando outra chamada da mesma conversa (ms)
+DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS=30000
 
 # Logging
 LOG_LEVEL=info
@@ -104,11 +120,32 @@ LOG_LEVEL=info
 | Variável | Descrição | Default | Obrigatória |
 |----------|-----------|---------|------------|
 | `PORT` | Porta HTTP do servidor | `3000` | Não |
-| `API_KEY` | Chave para autenticação de requests | - | Não |
+| `HOST` | Interface HTTP; use `0.0.0.0` somente quando necessário | `127.0.0.1` | Não |
+| `API_KEY` | Chave para autenticação de requests | - | Somente se `HOST` não for loopback |
 | `PLAYWRIGHT_HEADLESS` | Executar browser em modo headless | `true` | Não |
 | `PLAYWRIGHT_TIMEOUT` | Timeout para operações do Playwright (ms) | `30000` | Não |
+| `DEEPSPROXY_POW_QUEUE_MAX` | Máximo de capturas PoW ativas/enfileiradas | `32` | Não |
+| `DEEPSPROXY_POW_TIMEOUT_MS` | Deadline total da captura PoW, incluindo fila | `30000` | Não |
+| `DEEPSPROXY_POW_CLEANUP_GRACE_MS` | Limite adicional para limpeza após timeout PoW | `1000` | Não |
+| `DEEPSPROXY_UPSTREAM_TIMEOUT_MS` | Deadline do stream DeepSeek; libera locks ao expirar | `300000` | Não |
+| `DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS` | Limite de espera por uma conversa ocupada | `30000` | Não |
 
 \* Necessária para funcionalidades que requerem acesso à API DeepSeek
+
+### Sessões de contexto longo
+
+O proxy mantém a conversa no histórico remoto do DeepSeek e envia somente os
+turnos ainda não registrados. A continuidade explícita usa o campo de extensão
+`session_id` (de preferência o valor devolvido pelo proxy) ou os headers
+`x-deeps-session`/`x-session-id`. Como fallback, o proxy usa um prefixo exato do
+histórico de mensagens. O campo OpenAI `user` mantém sua semântica original e
+não identifica conversas.
+
+`/v1/models` anuncia uma janela de 1.000.000 tokens para DeepSeek V4. Em uma
+validação real, uma única sessão acumulou 897.555 tokens e recuperou marcadores
+do primeiro, do meio e do último segmento. A rota Web ainda limita o tamanho de
+um turno individual; a janela longa depende da continuação incremental da mesma
+sessão.
 
 ---
 
@@ -129,6 +166,11 @@ Resposta para autenticação falha:
 { "error": "Unauthorized" }
 ```
 Status: `401`
+
+Por segurança, o processo exige `API_KEY` quando `HOST` não é loopback. O
+DeepsProxy é um adaptador de sessão única: não compartilhe a mesma instância ou
+chave entre usuários não confiáveis. Trate os valores `session_id` como
+identificadores opacos e não previsíveis.
 
 ---
 

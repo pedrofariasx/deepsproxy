@@ -37,6 +37,17 @@ export function getContextLength(model: string): number {
   return Math.ceil(stats.detectedLimit / 3.5);
 }
 
+/**
+ * True only when the upstream error is a genuine context-window overflow.
+ * Generic failures (network, login, 5xx, empty replies) must NOT lower the
+ * context estimate — only a server-side rejection naming the context limit
+ * is evidence that the prompt was actually too large.
+ */
+export function isContextOverflowError(err: any): boolean {
+  const message = String(err?.message || err || '');
+  return /maximum context length|context length|context window|too many tokens|prompt is too long/i.test(message);
+}
+
 export function recordSuccess(model: string, promptSize: number): void {
   const stats = initTelemetry(model);
   stats.maxSuccessSize = Math.max(stats.maxSuccessSize, promptSize);
